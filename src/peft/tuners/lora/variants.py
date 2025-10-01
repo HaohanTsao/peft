@@ -697,6 +697,187 @@ def is_alora_relevant_in_batch(model: nn.Module, adapter_names: Optional[list[st
     return is_alora_relevant
 
 
+class GraLoraLinearVariant(LoraVariant):
+    """
+    GraLoRA (Granular Low-Rank Adaptation) variant for Linear layers.
+
+    This variant applies low-rank adaptation to granular sub-blocks of weight matrices,
+    with information exchange between blocks through tensor permutation operations.
+    """
+
+    @staticmethod
+    def init(module: Linear, adapter_name: str, **kwargs: Any) -> None:
+        """
+        Initialize GraLoRA variant. The actual parameter initialization is handled
+        by LoraLayer._init_gralora() which is called before this method.
+        """
+        # Validation: ensure GraLoRA parameters exist
+        if adapter_name not in module.gralora_A:
+            raise ValueError(f"GraLoRA parameters not found for adapter {adapter_name}")
+
+    @staticmethod
+    def merge_safe(module: Linear, active_adapter: str, orig_weight: torch.Tensor) -> torch.Tensor:
+        """
+        Safe merge of GraLoRA weights into base weights.
+
+        Computes the block-diagonal delta weight and adds it to the original weight.
+
+        Args:
+            module: The Linear layer with GraLoRA parameters
+            active_adapter: Name of the active adapter
+            orig_weight: Original base weight tensor
+
+        Returns:
+            torch.Tensor: New merged weight
+        """
+        orig_dtype = orig_weight.dtype
+        delta_weight = module.get_delta_weight(active_adapter)
+
+        # Merge: W_new = W_orig + ΔW
+        new_weight = orig_weight + delta_weight.to(orig_dtype)
+
+        # Check for NaN/Inf
+        if not torch.isfinite(new_weight).all():
+            raise ValueError(
+                f"NaNs detected in the merged weights. The adapter {active_adapter} seems to be broken"
+            )
+
+        return new_weight
+
+    @staticmethod
+    def merge_unsafe(module: Linear, active_adapter: str, orig_weight: torch.Tensor) -> None:
+        """
+        Unsafe merge of GraLoRA weights into base weights (in-place).
+
+        Args:
+            module: The Linear layer with GraLoRA parameters
+            active_adapter: Name of the active adapter
+            orig_weight: Original base weight tensor (modified in-place)
+        """
+        orig_dtype = orig_weight.dtype
+        delta_weight = module.get_delta_weight(active_adapter)
+
+        # In-place merge
+        orig_weight.data += delta_weight.to(orig_dtype)
+
+    @staticmethod
+    def unmerge(module: Linear, active_adapter: str, orig_weight: torch.Tensor) -> torch.Tensor:
+        """
+        Unmerge GraLoRA weights from base weights.
+
+        Args:
+            module: The Linear layer with GraLoRA parameters
+            active_adapter: Name of the active adapter
+            orig_weight: Merged weight tensor
+
+        Returns:
+            torch.Tensor: Original unmerged weight
+        """
+        orig_dtype = orig_weight.dtype
+        delta_weight = module.get_delta_weight(active_adapter)
+
+        # Unmerge: W_orig = W_merged - ΔW
+        new_weight = orig_weight - delta_weight.to(orig_dtype)
+
+        return new_weight
+
+    @staticmethod
+    def forward(
+        module: Linear,
+        active_adapter: str,
+        x: torch.Tensor,
+        result: torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
+        """
+        Forward pass for GraLoRA variant.
+
+        Applies granular low-rank adaptation with information exchange between sub-blocks.
+        The computation involves:
+        1. Splitting input into k x k sub-blocks
+        2. Applying low-rank matrices to each sub-block
+        3. Permuting to exchange information between blocks
+        4. Optionally applying hybrid vanilla LoRA
+
+        Args:
+            module: The Linear layer with GraLoRA parameters
+            active_adapter: Name of the active adapter
+            x: Input tensor
+            result: Output from base layer
+            **kwargs: Additional arguments (unused)
+
+        Returns:
+            Updated result tensor with GraLoRA adaptation applied
+        """
+        gralora_A = module.gralora_A[active_adapter]
+        gralora_B = module.gralora_B[active_adapter]
+        gralora_A_general = module.gralora_A_general[active_adapter]
+        gralora_B_general = module.gralora_B_general[active_adapter]
+
+        dropout = module.lora_dropout[active_adapter]
+        scaling = module.scaling[active_adapter]
+
+        r = module.r[active_adapter]
+        gralora_k = module.gralora_k[active_adapter]
+        hybrid_r = module.hybrid_r[active_adapter]
+
+        gralora_dtype = gralora_A.dtype
+        gralora_rank = r - hybrid_r
+        torch_result_dtype = result.dtype
+
+        # Handle input shape: can be 2D or 3D
+        if x.dim() == 2:
+            # [B, D] -> [B, 1, D]
+            x_reshaped = x.unsqueeze(1)
+            squeeze_output = True
+        else:
+            # [B, L, D]
+            x_reshaped = x
+            squeeze_output = False
+
+        B, L, in_features = x_reshaped.shape
+        N = gralora_k
+        subblock_gralora_rank = gralora_rank // N
+
+        # GraLoRA computation with information exchange
+        # Step 1: Split input and apply first low-rank matrix
+        # [B, L, N, in//N] @ [N, in//N, rank] -> [B, L, N, rank]
+        x_dropped = dropout(x_reshaped.to(gralora_dtype))
+        intermediate = torch.einsum(
+            "blni, nir -> blnr",
+            x_dropped.view(B, L, N, in_features // N),
+            gralora_A,
+        )
+
+        # Step 2: Reshape and permute for information exchange
+        # [B, L, N, rank] -> [B, L, N, N, rank//N] -> [B, L, N, N, rank//N]
+        intermediate = intermediate.view(B, L, N, N, subblock_gralora_rank)
+        intermediate = intermediate.permute(0, 1, 3, 2, 4)  # Swap dimensions for info exchange
+        intermediate = intermediate.reshape(B, L, N, N * subblock_gralora_rank)
+
+        # Step 3: Apply second low-rank matrix
+        # [B, L, N, rank] @ [N, rank, out//N] -> [B, L, N, out//N]
+        output = torch.einsum(
+            "bljr, jro -> bljo",
+            intermediate,
+            gralora_B,
+        )
+        output = output.reshape(B, L, -1)
+
+        # Remove the extra dimension if input was 2D
+        if squeeze_output:
+            output = output.squeeze(1)
+
+        result = result + scaling * output.to(torch_result_dtype)
+
+        # Hybrid LoRA part (if enabled)
+        if hybrid_r > 0:
+            hybrid_output = gralora_B_general(gralora_A_general(dropout(x.to(gralora_dtype))))
+            result = result + scaling * hybrid_output.to(torch_result_dtype)
+
+        return result
+
+
 def get_alora_offsets_for_forward(
     model: nn.Module, input_ids: torch.Tensor = None, inputs_embeds: torch.Tensor = None, **kwargs
 ):

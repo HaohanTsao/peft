@@ -663,6 +663,37 @@ class LoraConfig(PeftConfig):
     arrow_config: Optional[ArrowConfig] = field(
         default=None, metadata={"help": "The necessary config to apply arrow routing on the model."}
     )
+    use_gralora: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Enable GraLoRA (Granular Low-Rank Adaptation). This technique applies low-rank adaptation "
+                "to granular sub-blocks of weight matrices, potentially improving adaptation quality. "
+                "When enabled, weight matrices are split into gralora_k x gralora_k blocks, each with "
+                "independent low-rank adaptation."
+            )
+        },
+    )
+    gralora_k: int = field(
+        default=2,
+        metadata={
+            "help": (
+                "Number of splits per dimension for GraLoRA. The weight matrix will be divided into "
+                "gralora_k x gralora_k blocks. Must evenly divide both input and output dimensions. "
+                "Typical values: 2, 4, 8."
+            )
+        },
+    )
+    hybrid_r: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "Rank allocated to vanilla LoRA in Hybrid-GraLoRA mode. The total rank r will be split: "
+                "(r - hybrid_r) for GraLoRA blocks and hybrid_r for standard LoRA. Set to 0 to use "
+                "pure GraLoRA."
+            )
+        },
+    )
 
     def to_dict(self):
         """

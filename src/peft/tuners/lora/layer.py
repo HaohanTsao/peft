@@ -93,9 +93,26 @@ class LoraVariant:
 
 class LoraLayer(BaseTunerLayer):
     # All names of layers that may contain (trainable) adapter weights
-    adapter_layer_names: tuple[str, ...] = ("lora_A", "lora_B", "lora_embedding_A", "lora_embedding_B")
+    adapter_layer_names: tuple[str, ...] = (
+        "lora_A",
+        "lora_B",
+        "lora_embedding_A",
+        "lora_embedding_B",
+        "gralora_A",
+        "gralora_B",
+        "gralora_A_general",
+        "gralora_B_general",
+    )
+    
     # All names of other parameters that may contain adapter-related parameters
-    other_param_names: tuple[str, ...] = ("r", "lora_alpha", "scaling", "lora_dropout")
+    other_param_names: tuple[str, ...] = (
+        "r",
+        "lora_alpha",
+        "scaling",
+        "lora_dropout",
+        "gralora_k",
+        "hybrid_r",
+    )
 
     def __init__(self, base_layer: nn.Module, ephemeral_gpu_offload: bool = False, **kwargs) -> None:
         self.base_layer = base_layer
@@ -115,6 +132,14 @@ class LoraLayer(BaseTunerLayer):
         self.use_rslora: dict[str, bool] = {}
         self.lora_bias: dict[str, bool] = {}
         self.lora_magnitude_vector = torch.nn.ModuleDict()  # for DoRA
+        self.use_gralora: dict[str, bool] = {}
+        self.gralora_k: dict[str, int] = {}
+        self.hybrid_r: dict[str, int] = {}
+        self.gralora_A = nn.ParameterDict({})
+        self.gralora_B = nn.ParameterDict({})
+        self.gralora_A_general = nn.ModuleDict({})
+        self.gralora_B_general = nn.ModuleDict({})
+
         self._caches: dict[str, Any] = {}
         self.ephemeral_gpu_offload: bool = ephemeral_gpu_offload
         # flag to enable/disable casting of input to weight dtype during forward call
@@ -156,6 +181,9 @@ class LoraLayer(BaseTunerLayer):
         arrow_config: ArrowConfig = None,
         qalora_group_size: int = 32,
         inference_mode: bool = False,
+        use_gralora: bool = False,
+        gralora_k: int = 2,
+        hybrid_r: int = 0,
         **kwargs,
     ):
         # collect the kwargs
@@ -177,6 +205,7 @@ class LoraLayer(BaseTunerLayer):
             use_dora=use_dora,
             use_alora=use_alora,
             use_qalora=use_qalora,
+            use_gralora=use_gralora,
             qalora_group_size=qalora_group_size,
             arrow_config=arrow_config,
         )
@@ -229,6 +258,16 @@ class LoraLayer(BaseTunerLayer):
         # call this before init of the lora variants
         self._move_adapter_to_device_of_base_layer(adapter_name)
 
+        # Initialize GraLoRA parameters before variant init (if using GraLoRA)
+        if use_gralora:
+            self._init_gralora(adapter_name, r, gralora_k, hybrid_r, init_lora_weights)
+            self.use_gralora[adapter_name] = True
+            self.gralora_k[adapter_name] = gralora_k
+            self.hybrid_r[adapter_name] = hybrid_r
+        else:
+            self.use_gralora[adapter_name] = False
+
+        # Initialize variant (DoRA, aLoRA, GraLoRA, etc.)
         if adapter_name in self.lora_variant:
             self.lora_variant[adapter_name].init(self, **kwargs)
 
@@ -269,6 +308,65 @@ class LoraLayer(BaseTunerLayer):
             if self.lora_bias[adapter_name]:
                 # embeddings are not supported at the moment, but still adding this for consistency
                 nn.init.zeros_(self.lora_embedding_B[adapter_name].bias)
+    
+    def _init_gralora(self, adapter_name, r, gralora_k, hybrid_r, init_lora_weights):
+        """Initialize GraLoRA parameters"""
+        gralora_r = r - hybrid_r
+        
+        if gralora_r <= 0:
+            raise ValueError(f"GraLoRA rank must be positive, got r={r}, hybrid_r={hybrid_r}")
+        
+        if gralora_r % gralora_k != 0:
+            raise ValueError(
+                f"GraLoRA rank (r - hybrid_r = {gralora_r}) must be divisible by gralora_k ({gralora_k})"
+            )
+        
+        if self.in_features % gralora_k != 0 or self.out_features % gralora_k != 0:
+            raise ValueError(
+                f"Both in_features ({self.in_features}) and out_features ({self.out_features}) "
+                f"must be divisible by gralora_k ({gralora_k})"
+            )
+        
+        subblock_in_features = self.in_features // gralora_k
+        subblock_out_features = self.out_features // gralora_k
+        
+        # Initialize k pairs of (A, B) matrices
+        gralora_A_list = []
+        gralora_B_list = []
+        
+        for _ in range(gralora_k):
+            A = nn.Parameter(torch.zeros(gralora_r, subblock_in_features))
+            B = nn.Parameter(torch.zeros(subblock_out_features, gralora_r))
+            
+            if init_lora_weights:
+                nn.init.kaiming_uniform_(A, a=math.sqrt(5))
+                nn.init.zeros_(B)
+            
+            gralora_A_list.append(A)
+            gralora_B_list.append(B)
+        
+        # [k, rank, in//k] -> [k, in//k, rank]
+        gralora_A = torch.stack(gralora_A_list, dim=0).transpose(1, 2).contiguous()
+        # [k, out//k, rank] -> [k, rank, out//k]
+        gralora_B = torch.stack(gralora_B_list, dim=0).transpose(1, 2).contiguous()
+        
+        self.gralora_A[adapter_name] = nn.Parameter(gralora_A)
+        self.gralora_B[adapter_name] = nn.Parameter(gralora_B)
+        
+        # Hybrid
+        if hybrid_r > 0:
+            general_A = nn.Linear(self.in_features, hybrid_r, bias=False)
+            general_B = nn.Linear(hybrid_r, self.out_features, bias=False)
+            
+            if init_lora_weights:
+                nn.init.kaiming_uniform_(general_A.weight, a=math.sqrt(5))
+                nn.init.zeros_(general_B.weight)
+            
+            self.gralora_A_general[adapter_name] = general_A
+            self.gralora_B_general[adapter_name] = general_B
+        else:
+            self.gralora_A_general[adapter_name] = nn.Identity()
+            self.gralora_B_general[adapter_name] = nn.Identity()
 
     def olora_init(self, adapter_name):
         base_layer = self.get_base_layer()
@@ -613,6 +711,9 @@ class Linear(nn.Module, LoraLayer):
         use_alora: bool = False,
         arrow_config: ArrowConfig = None,
         lora_bias: bool = False,
+        use_gralora: bool = False,
+        gralora_k: int = 2,
+        hybrid_r: int = 0,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -631,16 +732,24 @@ class Linear(nn.Module, LoraLayer):
             use_alora=use_alora,
             lora_bias=lora_bias,
             arrow_config=arrow_config,
+            use_gralora=use_gralora,
+            gralora_k=gralora_k,
+            hybrid_r=hybrid_r,
         )
         self.is_target_conv_1d_layer = is_target_conv_1d_layer
 
     def resolve_lora_variant(
-        self, *, arrow_config: ArrowConfig, use_dora: bool, use_alora: bool, **kwargs
+        self, *, arrow_config: ArrowConfig, use_dora: bool, use_alora: bool, use_gralora: bool = False, **kwargs
     ) -> Optional[LoraVariant]:
         if arrow_config is not None:
             from .variants import ArrowLinearVariant
 
             return ArrowLinearVariant()
+
+        if use_gralora:
+            from .variants import GraLoraLinearVariant
+
+            return GraLoraLinearVariant()
 
         if not use_dora and not use_alora:
             return None
@@ -750,6 +859,11 @@ class Linear(nn.Module, LoraLayer):
             adapter (str):
                 The name of the adapter for which the delta weight should be computed.
         """
+        # Check if this is a GraLoRA adapter
+        if self.use_gralora.get(adapter, False):
+            return self._get_gralora_delta_weight(adapter)
+
+        # Standard LoRA delta weight computation
         device = self.lora_B[adapter].weight.device
         dtype = self.lora_B[adapter].weight.dtype
 
@@ -775,6 +889,91 @@ class Linear(nn.Module, LoraLayer):
             self.lora_B[adapter].weight.data = weight_B.to(dtype)
 
         return output_tensor
+
+    def _get_gralora_delta_weight(self, adapter) -> torch.Tensor:
+        """
+        Compute the delta weight for GraLoRA adapter.
+
+        GraLoRA splits the weight matrix into k×k sub-blocks and applies independent
+        low-rank adapters to each diagonal block, resulting in a block-diagonal structure.
+
+        Args:
+            adapter (str): The name of the adapter
+
+        Returns:
+            torch.Tensor: The delta weight matrix with shape [out_features, in_features]
+        """
+        gralora_A = self.gralora_A[adapter]  # [k, in_features//k, rank]
+        gralora_B = self.gralora_B[adapter]  # [k, rank, out_features//k]
+        gralora_A_general = self.gralora_A_general[adapter]
+        gralora_B_general = self.gralora_B_general[adapter]
+
+        device = gralora_A.device
+        dtype = gralora_A.dtype
+
+        r = self.r[adapter]
+        gralora_k = self.gralora_k[adapter]
+        hybrid_r = self.hybrid_r[adapter]
+
+        # Handle CPU fp16/bf16 casting
+        cast_to_fp32 = device.type == "cpu" and (dtype == torch.float16 or dtype == torch.bfloat16)
+
+        if cast_to_fp32:
+            gralora_A = gralora_A.float()
+            gralora_B = gralora_B.float()
+
+        # Get dimensions
+        in_features = self.in_features
+        out_features = self.out_features
+        subblock_in = in_features // gralora_k
+        subblock_out = out_features // gralora_k
+
+        # Initialize delta weight as zeros
+        delta_weight = torch.zeros(out_features, in_features, device=device, dtype=gralora_A.dtype)
+
+        # Compute block-diagonal delta weight
+        # For each diagonal block i: delta_block[i] = B[i].T @ A[i]
+        # This follows standard LoRA: ΔW = B @ A where B is [out, rank] and A is [rank, in]
+        for i in range(gralora_k):
+            # Get the i-th block's A and B matrices
+            A_i = gralora_A[i]  # [in_features//k, rank]
+            B_i = gralora_B[i]  # [rank, out_features//k]
+
+            # Compute delta for this block: B_i.T @ A_i.T
+            # A_i: [in_features//k, rank] -> A_i.T: [rank, in_features//k]
+            # B_i: [rank, out_features//k] -> B_i.T: [out_features//k, rank]
+            # Result: [out_features//k, rank] @ [rank, in_features//k] = [out_features//k, in_features//k]
+            delta_block = B_i.T @ A_i.T
+
+            # Place this block on the diagonal
+            row_start = i * subblock_out
+            row_end = (i + 1) * subblock_out
+            col_start = i * subblock_in
+            col_end = (i + 1) * subblock_in
+
+            delta_weight[row_start:row_end, col_start:col_end] = delta_block
+
+        # Add hybrid LoRA component if present
+        if hybrid_r > 0:
+            # general_A: [in_features, hybrid_r], general_B: [hybrid_r, out_features]
+            weight_A_general = gralora_A_general.weight  # [hybrid_r, in_features]
+            weight_B_general = gralora_B_general.weight  # [out_features, hybrid_r]
+
+            if cast_to_fp32:
+                weight_A_general = weight_A_general.float()
+                weight_B_general = weight_B_general.float()
+
+            # Compute delta for hybrid part: [out_features, hybrid_r] @ [hybrid_r, in_features]
+            delta_weight += weight_B_general @ weight_A_general
+
+        # Apply scaling and transpose if needed
+        delta_weight = transpose(delta_weight, self.fan_in_fan_out) * self.scaling[adapter]
+
+        # Cast back if needed
+        if cast_to_fp32:
+            delta_weight = delta_weight.to(dtype=dtype)
+
+        return delta_weight
 
     def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
         self._check_forward_args(x, *args, **kwargs)
@@ -803,6 +1002,7 @@ class Linear(nn.Module, LoraLayer):
                 dropout = self.lora_dropout[active_adapter]
                 scaling = self.scaling[active_adapter]
                 x = self._cast_input_dtype(x, lora_A.weight.dtype)
+
                 if active_adapter not in self.lora_variant:  # vanilla LoRA
                     result = result + lora_B(lora_A(dropout(x))) * scaling
                 else:
